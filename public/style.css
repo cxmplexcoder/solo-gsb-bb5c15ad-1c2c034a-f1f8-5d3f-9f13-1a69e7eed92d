@@ -211,6 +211,17 @@ input:focus { outline: 2px solid var(--accent-dark); border-color: var(--accent)
 .plan-item summary { cursor: pointer; }
 .plan-meta { color: var(--muted); font-size: 0.84rem; margin-top: 4px; }
 .plan-actions { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+.plan-preview { margin-top: 10px; }
+.plan-preview-loading { margin: 8px 0; font-size: 0.86rem; }
+.plan-preview-box .table-wrap { margin-top: 8px; }
+tr.row-changed td { border-bottom-color: rgba(63, 206, 124, 0.25); }
+.preview-errors {
+  margin: 0 0 6px;
+  padding-left: 20px;
+  color: var(--warn);
+  font-size: 0.86rem;
+}
+.preview-errors li { margin: 3px 0; }
 
 .empty-state { color: var(--muted); text-align: center; padding: 18px 0; font-size: 0.9rem; }
 

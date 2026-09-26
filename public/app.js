@@ -24,7 +24,12 @@ async function api(path, options = {}) {
     ...options,
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `请求失败（${res.status}）`);
+  if (!res.ok) {
+    const err = new Error(data.error || `请求失败（${res.status}）`);
+    err.status = res.status;
+    err.data = data;
+    throw err;
+  }
   return data;
 }
 
@@ -385,17 +390,12 @@ async function loadPlans() {
           <tbody>${rows}</tbody>
         </table></div>
         <div class="plan-actions">
-          <button class="btn btn-sm btn-primary" data-act="apply">应用到设备</button>
+          <button class="btn btn-sm btn-primary" data-act="preview">应用前预览</button>
           <button class="btn btn-sm btn-danger" data-act="del">删除方案</button>
         </div>
+        <div class="plan-preview" data-role="preview" hidden></div>
       </details>`;
-    div.querySelector('[data-act="apply"]').addEventListener('click', async () => {
-      try {
-        const res = await api(`/api/plans/${p.id}/apply`, { method: 'POST' });
-        toast(`已应用方案，更新 ${res.applied} 个设备`);
-        await loadDevices();
-      } catch (e) { toast(e.message, true); }
-    });
+    div.querySelector('[data-act="preview"]').addEventListener('click', () => previewPlan(p, div));
     div.querySelector('[data-act="del"]').addEventListener('click', async () => {
       if (!confirm(`确定删除方案「${p.name}」？`)) return;
       try {
@@ -406,6 +406,120 @@ async function loadPlans() {
     });
     box.appendChild(div);
   }
+}
+
+/** 应用前预览：按设备 id 展示当前频率与目标频率，并做服务端检查 */
+async function previewPlan(plan, itemEl) {
+  const panel = itemEl.querySelector('[data-role="preview"]');
+  const btn = itemEl.querySelector('[data-act="preview"]');
+  panel.hidden = false;
+  panel.innerHTML = '<p class="muted plan-preview-loading">正在复算互调冲突与占用区间…</p>';
+  btn.disabled = true;
+  try {
+    const res = await api(`/api/plans/${plan.id}/preview`, { method: 'POST' });
+    renderPreviewOk(plan, res, panel, itemEl);
+  } catch (e) {
+    if (e.status === 422 && e.data) {
+      renderPreviewFailed(plan, e.data, panel);
+    } else {
+      panel.innerHTML = `<p class="warn-text">预览失败：${esc(e.message)}</p>`;
+    }
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function previewDeviceRows(devices) {
+  return devices.map((d) => {
+    const hasTarget = d.target !== null && d.target !== undefined;
+    return `<tr${d.changed ? ' class="row-changed"' : ''}>
+      <td>${esc(d.name)} ${d.locked ? '<span class="tag locked">锁定</span>' : ''}</td>
+      <td class="freq">${fmt(d.current)}</td>
+      <td class="freq ${d.changed ? 'ok-text' : 'muted'}">${hasTarget ? fmt(d.target) : '—'}</td>
+      <td class="freq">${d.changed ? `−${fmt(d.current)} → ${fmt(d.target)}` : '<span class="muted">不变</span>'}</td>
+    </tr>`;
+  }).join('');
+}
+
+/** 预览成功：展示全部设备的当前 → 目标状态与确认按钮（携带凭据） */
+function renderPreviewOk(plan, res, panel, itemEl) {
+  const occ = occupiedSummary(res.occupiedBands);
+  panel.innerHTML = `
+    <div class="result-box success plan-preview-box">
+      <p class="ok-text" style="margin:0 0 4px">✓ 预览检查通过：互调冲突 ${res.conflictCount} 处，
+        目标频率均合法，锁定设备未改频${occ ? '，保护区与现场占用区间不相交' : '（方案无占用区间）'}</p>
+      <p class="plan-meta" style="margin:0 0 6px">检查时间：${esc(new Date(res.checkedAt).toLocaleString('zh-CN'))}
+        ${occ ? `｜现场占用区间：🚧 ${esc(occ)}` : ''}</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>设备（按 ID 对应）</th><th>当前频率 (MHz)</th><th>目标频率 (MHz)</th><th>变化</th></tr></thead>
+        <tbody>${previewDeviceRows(res.devices)}</tbody>
+      </table></div>
+      <p class="hint" style="margin-top:8px">确认后将在同一事务内再次核对凭据与全部检查并一次性写入；
+        若期间设备状态变化，应用会被拒绝且不会写入任何设备。</p>
+      <div class="save-plan-row">
+        <button class="btn btn-primary" data-role="confirm">确认应用（共 ${res.devices.length} 个设备）</button>
+        <button class="btn btn-ghost btn-sm" data-role="cancel">取消</button>
+      </div>
+    </div>`;
+  panel.querySelector('[data-role="cancel"]').addEventListener('click', () => {
+    panel.hidden = true;
+    panel.innerHTML = '';
+  });
+  panel.querySelector('[data-role="confirm"]').addEventListener('click', async (ev) => {
+    const confirmBtn = ev.currentTarget;
+    confirmBtn.disabled = true;
+    confirmBtn.textContent = '应用中…';
+    try {
+      const r = await api(`/api/plans/${plan.id}/apply`, {
+        method: 'POST',
+        body: JSON.stringify({ credential: res.credential }),
+      });
+      toast(`已应用方案，更新 ${r.applied} 个设备`);
+      panel.hidden = true;
+      panel.innerHTML = '';
+      await loadDevices();
+      await loadPlans();
+    } catch (e) {
+      // 409：状态变化或凭据缺失/无效，不写入任何设备，提示重新预览
+      if (e.status === 409 && e.data) {
+        renderPreviewStale(plan, e.data, panel, itemEl);
+      } else {
+        toast(e.message, true);
+        confirmBtn.disabled = false;
+        confirmBtn.textContent = `确认应用（共 ${res.devices.length} 个设备）`;
+      }
+    }
+  });
+}
+
+/** 预览阶段检查失败：列明全部原因，禁止应用（不提供确认按钮） */
+function renderPreviewFailed(plan, data, panel) {
+  const reasons = (data.errors || []).map((msg) => `<li>${esc(msg)}</li>`).join('');
+  const rows = data.devices && data.devices.length ? `
+    <div class="table-wrap"><table>
+      <thead><tr><th>设备</th><th>当前频率 (MHz)</th><th>目标频率 (MHz)</th><th>变化</th></tr></thead>
+      <tbody>${previewDeviceRows(data.devices)}</tbody>
+    </table></div>` : '';
+  panel.innerHTML = `
+    <div class="result-box failure plan-preview-box">
+      <p class="warn-text" style="margin:0 0 6px">✗ 应用前检查未通过，该方案禁止应用：</p>
+      <ul class="preview-errors">${reasons || `<li>${esc(data.error || '检查失败')}</li>`}</ul>
+      ${rows}
+    </div>`;
+}
+
+/** 确认阶段被拒（409）：凭据失效或设备状态已变，引导重新预览 */
+function renderPreviewStale(plan, data, panel, itemEl) {
+  const reasons = (data.errors || []).map((msg) => `<li>${esc(msg)}</li>`).join('');
+  panel.innerHTML = `
+    <div class="result-box failure plan-preview-box">
+      <p class="warn-text" style="margin:0 0 6px">⚠ ${esc(data.error || '确认凭据已失效')}，未写入任何设备。</p>
+      ${reasons ? `<ul class="preview-errors">${reasons}</ul>` : ''}
+      <div class="save-plan-row">
+        <button class="btn btn-primary" data-role="represent">重新预览</button>
+      </div>
+    </div>`;
+  panel.querySelector('[data-role="represent"]').addEventListener('click', () => previewPlan(plan, itemEl));
 }
 
 $('#btn-refresh-plans').addEventListener('click', () => loadPlans().catch((e) => toast(e.message, true)));
