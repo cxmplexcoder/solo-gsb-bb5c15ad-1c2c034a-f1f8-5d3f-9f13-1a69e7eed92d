@@ -82,6 +82,22 @@
   </main>
 
   <div id="toast" class="toast" hidden></div>
+
+  <!-- 方案应用前预览弹窗 -->
+  <div id="preview-modal" class="modal-backdrop" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="preview-title">
+      <div class="modal-head">
+        <h2 id="preview-title">方案应用前预览</h2>
+        <button type="button" class="btn btn-sm btn-ghost" id="btn-preview-close">关闭</button>
+      </div>
+      <div id="preview-body" class="modal-body"></div>
+      <div class="modal-foot">
+        <button type="button" class="btn" id="btn-repreview">重新预览</button>
+        <button type="button" class="btn btn-primary" id="btn-confirm-apply">确认应用到全部设备</button>
+      </div>
+    </div>
+  </div>
+
   <script src="app.js"></script>
 </body>
 </html>

@@ -24,7 +24,12 @@ async function api(path, options = {}) {
     ...options,
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `请求失败（${res.status}）`);
+  if (!res.ok) {
+    const err = new Error(data.error || `请求失败（${res.status}）`);
+    err.status = res.status;
+    err.data = data;
+    throw err;
+  }
   return data;
 }
 
@@ -362,40 +367,37 @@ async function loadPlans() {
   for (const p of plans) {
     const div = document.createElement('div');
     div.className = 'plan-item';
-    const rows = p.assignments.map((a) => `
+    const assignments = Array.isArray(p.assignments) ? p.assignments : [];
+    const params = p.params || {};
+    const rows = assignments.map((a) => `
       <tr>
-        <td>${esc(a.name)} ${a.locked ? '<span class="tag locked">锁定</span>' : ''}</td>
-        <td class="freq">${fmt(a.original)}</td>
-        <td class="freq">${fmt(a.frequency)}</td>
+        <td>${esc(a.name || `设备 ${a.id}`)} ${a.locked ? '<span class="tag locked">锁定</span>' : ''}</td>
+        <td class="freq">${a.original === undefined || a.original === null ? '—' : fmt(a.original)}</td>
+        <td class="freq">${a.frequency === undefined || a.frequency === null ? '—' : fmt(a.frequency)}</td>
         <td class="freq">${a.offset > 0 ? fmt(a.offset) : '0'}</td>
       </tr>`).join('');
+    const num = (v) => (v === undefined || v === null || Number.isNaN(Number(v)) ? '—' : fmt(Number(v)));
     div.innerHTML = `
       <details>
         <summary><strong>${esc(p.name)}</strong>
           <span class="badge ${p.solved ? 'ok' : 'danger'}">${p.solved ? '无冲突' : '无解'}</span>
         </summary>
         <p class="plan-meta">
-          保存时间：${esc(p.createdAt)} ｜ 频段 ${fmt(p.params.bandMin)}–${fmt(p.params.bandMax)} MHz ｜
-          步进 ${fmt(p.params.step)} MHz ｜ 最大偏移 ${fmt(p.params.maxOffset)} MHz ｜
-          总偏移 <span class="freq">${fmt(p.totalOffset)}</span> MHz
+          保存时间：${esc(p.createdAt)} ｜ 频段 ${num(params.bandMin)}–${num(params.bandMax)} MHz ｜
+          步进 ${num(params.step)} MHz ｜ 最大偏移 ${num(params.maxOffset)} MHz ｜
+          总偏移 <span class="freq">${num(p.totalOffset)}</span> MHz
         </p>
-        <p class="plan-meta">现场占用频段：${occupiedSummary(p.params.occupiedBands) ? '🚧 ' + esc(occupiedSummary(p.params.occupiedBands)) : '无'}</p>
+        <p class="plan-meta">现场占用频段：${occupiedSummary(params.occupiedBands) ? '🚧 ' + esc(occupiedSummary(params.occupiedBands)) : '无'}</p>
         <div class="table-wrap"><table>
           <thead><tr><th>频道</th><th>原频率 (MHz)</th><th>方案频率 (MHz)</th><th>偏移 (MHz)</th></tr></thead>
           <tbody>${rows}</tbody>
         </table></div>
         <div class="plan-actions">
-          <button class="btn btn-sm btn-primary" data-act="apply">应用到设备</button>
+          <button class="btn btn-sm btn-primary" data-act="apply">预览后应用</button>
           <button class="btn btn-sm btn-danger" data-act="del">删除方案</button>
         </div>
       </details>`;
-    div.querySelector('[data-act="apply"]').addEventListener('click', async () => {
-      try {
-        const res = await api(`/api/plans/${p.id}/apply`, { method: 'POST' });
-        toast(`已应用方案，更新 ${res.applied} 个设备`);
-        await loadDevices();
-      } catch (e) { toast(e.message, true); }
-    });
+    div.querySelector('[data-act="apply"]').addEventListener('click', () => openPreview(p.id));
     div.querySelector('[data-act="del"]').addEventListener('click', async () => {
       if (!confirm(`确定删除方案「${p.name}」？`)) return;
       try {
@@ -409,6 +411,119 @@ async function loadPlans() {
 }
 
 $('#btn-refresh-plans').addEventListener('click', () => loadPlans().catch((e) => toast(e.message, true)));
+
+/* ---------- 方案应用前预览 ---------- */
+
+let previewState = null; // { planId, token, data }
+
+const modal = $('#preview-modal');
+
+function closePreview() {
+  modal.hidden = true;
+  previewState = null;
+}
+
+/** 渲染预览结果（检查通过 / 失败均用同一套明细） */
+function renderPreviewBody(payload, failed) {
+  const body = $('#preview-body');
+  const p = payload.plan || {};
+  const rows = (payload.devices || []).map((d) => `
+    <tr>
+      <td>${esc(d.name)} ${d.locked ? '<span class="tag locked">锁定</span>' : ''}</td>
+      <td class="freq">${fmt(d.current)}</td>
+      <td class="freq ${d.changed ? 'ok-text' : ''}">${d.target === null ? '—' : fmt(d.target)}</td>
+      <td>${d.changed ? '<span class="tag moved">将调整</span>' : '<span class="muted">不变</span>'}</td>
+    </tr>`).join('');
+
+  const occText = occupiedSummary(payload.occupiedBands);
+  const checkLines = (payload.checks || []).map((c) => `
+    <li class="${c.ok ? 'ok-text' : 'danger-text'}">${c.ok ? '✓' : '✗'} ${esc(c.name)}</li>`).join('');
+
+  const reasonsHtml = failed && payload.reasons && payload.reasons.length
+    ? `<div class="preview-reasons">
+        <p class="danger-text" style="margin:0 0 6px"><strong>检查未通过，已禁止应用：</strong></p>
+        <ul>${payload.reasons.map((r) => `<li class="danger-text">${esc(r)}</li>`).join('')}</ul>
+      </div>`
+    : '';
+
+  const successHtml = failed ? '' : `
+    <p class="ok-text" style="margin:0 0 8px">✓ 预览检查全部通过：目标配置无互调冲突、保护区不侵入占用区间，确认后将一次性写入全部设备。</p>
+    <p class="hint" style="margin:0 0 8px">确认凭据仅本次有效，有效期 10 分钟；若期间设备或方案发生变化，确认将被拒绝并提示重新预览。</p>`;
+
+  body.innerHTML = `
+    ${failed
+      ? `<div class="preview-banner failure">方案「${esc(p.name || '')}」预览失败，以下问题处理后请重新预览。</div>`
+      : `<div class="preview-banner success">方案「${esc(p.name || '')}」预览成功，可确认应用。</div>`}
+    ${reasonsHtml}
+    ${successHtml}
+    <ul class="check-list">${checkLines}</ul>
+    <p class="plan-meta" style="margin:8px 0">
+      现场占用频段：${occText ? '🚧 ' + esc(occText) : '无（旧方案缺省按空数组处理）'}
+    </p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>设备（按设备 ID）</th><th>当前频率 (MHz)</th><th>目标频率 (MHz)</th><th>状态</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table></div>`;
+}
+
+async function openPreview(planId) {
+  modal.hidden = false;
+  previewState = { planId, token: null };
+  $('#btn-confirm-apply').disabled = true;
+  $('#btn-repreview').disabled = true;
+  $('#preview-body').innerHTML = '<p class="empty-state">正在检查…</p>';
+  try {
+    const data = await api(`/api/plans/${planId}/preview`, { method: 'POST' });
+    previewState = { planId, token: data.token, data };
+    renderPreviewBody(data, false);
+    $('#btn-confirm-apply').disabled = false;
+  } catch (e) {
+    if (e.status === 422) {
+      renderPreviewBody(e.data, true);
+    } else {
+      $('#preview-body').innerHTML = `<p class="danger-text">预览失败：${esc(e.message)}</p>`;
+    }
+  } finally {
+    $('#btn-repreview').disabled = false;
+  }
+}
+
+$('#btn-preview-close').addEventListener('click', closePreview);
+$('#btn-repreview').addEventListener('click', () => {
+  if (previewState) openPreview(previewState.planId).catch((e) => toast(e.message, true));
+});
+modal.addEventListener('click', (e) => { if (e.target === modal) closePreview(); });
+
+$('#btn-confirm-apply').addEventListener('click', async () => {
+  if (!previewState || !previewState.token) return;
+  const btn = $('#btn-confirm-apply');
+  btn.disabled = true;
+  try {
+    const res = await api(`/api/plans/${previewState.planId}/apply`, {
+      method: 'POST',
+      body: JSON.stringify({ token: previewState.token }),
+    });
+    closePreview();
+    toast(`已应用方案：写入 ${res.applied} 个设备，其中 ${res.changed} 个频率变化`);
+    await loadDevices();
+  } catch (e) {
+    // 409：状态变化或凭据缺失/失效，未写入任何设备，提示重新预览
+    if (e.status === 409) {
+      toast(`应用被拒绝：${e.message}`, true);
+      previewState.token = null;
+      $('#btn-confirm-apply').disabled = true;
+      const body = $('#preview-body');
+      body.insertAdjacentHTML('afterbegin', `
+        <div class="preview-banner failure">⚠ ${esc(e.message)}${(e.data.reasons || []).length ? '' : ''}
+          ${(e.data.reasons || []).map((r) => `<br>· ${esc(r)}`).join('')}
+          <br>请点击「重新预览」后再应用。
+        </div>`);
+    } else {
+      btn.disabled = false;
+      toast(e.message, true);
+    }
+  }
+});
 
 /* ---------- 启动 ---------- */
 
